@@ -23,36 +23,40 @@ from modules import (
 
 
 class TagSpeechBaseModel(LalmModel):
-    """Dual audio encoders, separate projectors, and LLM integration.
+    r"""Dual audio encoders, separate projectors, and LLM integration.
 
     TagSpeechModel adds semantic anchors and speaker conditioning. The main
     cross-attention configuration sends one conditioned semantic stream to
     the LLM using the prompt <audio><|AUDIO|></audio>.
 
     Main TagSpeechModel pipeline:
-                         Audio input
-                        /           \
-             Semantic encoder     Voice encoder
-                     |                  |
-             Semantic projector   Voice projector
-                     |                  |
-              Numeric anchors     Temporal convolution + residual
-                     |                  |
-                    H_sem         Sinusoidal speaker kernel
-                     |                  |           \
-                  Queries          Keys/values    Boundary head
-                      \                /                |
-                       Cross-attention              Boundary loss
-                              |
-                          MLP adapter
-                              |
-                      Add residual H_sem
-                              |
-                  Single conditioned audio stream
-                              |
-                             LLM
-                              |
-                  Timestamped text and speakers
+                         Audio
+                    /             \
+          Semantic encoder      Voice encoder
+                 |                    |
+             Projector            Projector
+                 |                    |
+          Numeric anchors     Temporal convolution
+                 |              + residual
+               H_sem                  |
+                 |            Sinusoidal kernel
+                 |                    |
+                 |                    +--> Boundary head --> Boundary loss
+                 |                    |
+              Queries             Keys / Values
+                  \                  /
+                    Cross-attention
+                           |
+                       MLP adapter
+                           |
+                     Add H_sem residual
+                           |
+                  Conditioned semantic stream
+                           |
+                          LLM
+                           |
+                 Timestamped text / speakers
+
     """
 
     def __init__(self, config, tokenizer, pretrained_llm=None):
@@ -798,32 +802,35 @@ class TagSpeechBaseModel(LalmModel):
 
 
 class TagSpeechModel(TagSpeechBaseModel):
-    """TagSpeech with semantic numeric anchors and speaker conditioning.
+    r"""TagSpeech with semantic numeric anchors and speaker conditioning.
 
     Main TagSpeechModel pipeline:
-                         Audio input
-                        /           \
-             Semantic encoder     Voice encoder
-                     |                  |
-             Semantic projector   Voice projector
-                     |                  |
-              Numeric anchors     Temporal convolution + residual
-                     |                  |
-                    H_sem         Sinusoidal speaker kernel
-                     |                  |           \
-                  Queries          Keys/values    Boundary head
-                      \                /                |
-                       Cross-attention              Boundary loss
-                              |
-                          MLP adapter
-                              |
-                      Add residual H_sem
-                              |
-                  Single conditioned audio stream
-                              |
-                             LLM
-                              |
-                  Timestamped text and speakers
+                         Audio
+                    /             \
+          Semantic encoder      Voice encoder
+                 |                    |
+             Projector            Projector
+                 |                    |
+          Numeric anchors     Temporal convolution
+                 |              + residual
+               H_sem                  |
+                 |            Sinusoidal kernel
+                 |                    |
+                 |                    +--> Boundary head --> Boundary loss
+                 |                    |
+              Queries             Keys / Values
+                  \                  /
+                    Cross-attention
+                           |
+                       MLP adapter
+                           |
+                     Add H_sem residual
+                           |
+                  Conditioned semantic stream
+                           |
+                          LLM
+                           |
+                 Timestamped text / speakers
 
     Numeric anchors come from the active decoder's digit embeddings and are
     inserted into semantic features before cross-attention. The speaker kernel

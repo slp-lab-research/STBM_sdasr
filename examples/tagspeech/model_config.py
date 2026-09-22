@@ -11,34 +11,38 @@ from auden.models.lalm.model_config import LalmConfig
 
 
 class TagSpeechBaseConfig(LalmConfig):
-    """Configuration for dual audio encoders and separate projectors.
+    r"""Configuration for dual audio encoders and separate projectors.
 
     TagSpeechConfig adds numeric anchors and the speaker-conditioning pipeline.
 
     Main TagSpeechModel pipeline:
-                         Audio input
-                        /           \
-             Semantic encoder     Voice encoder
-                     |                  |
-             Semantic projector   Voice projector
-                     |                  |
-              Numeric anchors     Temporal convolution + residual
-                     |                  |
-                    H_sem         Sinusoidal speaker kernel
-                     |                  |           \
-                  Queries          Keys/values    Boundary head
-                      \                /                |
-                       Cross-attention              Boundary loss
-                              |
-                          MLP adapter
-                              |
-                      Add residual H_sem
-                              |
-                  Single conditioned audio stream
-                              |
-                             LLM
-                              |
-                  Timestamped text and speakers
+                         Audio
+                    /             \
+          Semantic encoder      Voice encoder
+                 |                    |
+             Projector            Projector
+                 |                    |
+          Numeric anchors     Temporal convolution
+                 |              + residual
+               H_sem                  |
+                 |            Sinusoidal kernel
+                 |                    |
+                 |                    +--> Boundary head --> Boundary loss
+                 |                    |
+              Queries             Keys / Values
+                  \                  /
+                    Cross-attention
+                           |
+                       MLP adapter
+                           |
+                     Add H_sem residual
+                           |
+                  Conditioned semantic stream
+                           |
+                          LLM
+                           |
+                 Timestamped text / speakers
+
     """
 
     model_type: str = "tagspeech-base"

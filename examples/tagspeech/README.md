@@ -5,20 +5,32 @@ This TagSpeech variant performs multi-speaker transcription and diarization usin
 The main pipeline is:
 
 ```text
-Audio → semantic encoder → projector → numeric anchors ────── queries
-Audio → voice encoder → projector → temporal convolution
-                                  → sinusoidal kernel ────── keys/values
-                                            │                    │
-                                            ↓                    ↓
-                                      boundary head       cross-attention
-                                                                 ↓
-                                                            MLP adapter
-                                                                 ↓
-                                               residual to semantic features
-                                                                 ↓
-                                                                LLM
-                                                                 ↓
-                                                  timestamped text and speakers
+                     Audio
+                /             \
+      Semantic encoder      Voice encoder
+             |                    |
+         Projector            Projector
+             |                    |
+      Numeric anchors     Temporal convolution
+             |              + residual
+           H_sem                  |
+             |            Sinusoidal kernel
+             |                    |
+             |                    +--> Boundary head --> Boundary loss
+             |                    |
+          Queries             Keys / Values
+              \                  /
+                Cross-attention
+                       |
+                   MLP adapter
+                       |
+                 Add H_sem residual
+                       |
+              Conditioned semantic stream
+                       |
+                      LLM
+                       |
+             Timestamped text / speakers
 ```
 
 The kernel operates on speaker features. Cross-attention combines the streams afterward. Temporal convolution also uses a residual connection. The main configuration trains with XML token cross-entropy plus boundary binary cross-entropy, with both loss weights set to 1.0. 
