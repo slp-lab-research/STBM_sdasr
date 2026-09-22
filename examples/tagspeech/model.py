@@ -28,35 +28,6 @@ class TagSpeechBaseModel(LalmModel):
     TagSpeechModel adds semantic anchors and speaker conditioning. The main
     cross-attention configuration sends one conditioned semantic stream to
     the LLM using the prompt <audio><|AUDIO|></audio>.
-
-    Main TagSpeechModel pipeline:
-                         Audio
-                    /             \
-          Semantic encoder      Voice encoder
-                 |                    |
-             Projector            Projector
-                 |                    |
-          Numeric anchors     Temporal convolution
-                 |              + residual
-               H_sem                  |
-                 |            Sinusoidal kernel
-                 |                    |
-                 |                    +--> Boundary head --> Boundary loss
-                 |                    |
-              Queries             Keys / Values
-                  \                  /
-                    Cross-attention
-                           |
-                       MLP adapter
-                           |
-                     Add H_sem residual
-                           |
-                  Conditioned semantic stream
-                           |
-                          LLM
-                           |
-                 Timestamped text / speakers
-
     """
 
     def __init__(self, config, tokenizer, pretrained_llm=None):
