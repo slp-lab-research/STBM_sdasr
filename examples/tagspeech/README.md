@@ -63,7 +63,7 @@ model:
 
 The AMI defaults expect encoder files under `experiments/diarization_AMI/audio_encoder/` and `experiments/diarization_AMI/voice_encoder/`. Place the corresponding encoder weights and configurations there, or update their paths. The older `diarization_AMI` directory supplies encoder assets; the new training output uses a separate directory.
 
-Dataset manifests must reference accessible audio files and, when applicable, feature files. Updating the YAML manifest location alone does not rewrite paths inside a manifest. Dataset preparation helpers under `dataset/` use paths relative to this example directory.
+Dataset manifests must reference accessible audio files and, when applicable, feature files. Updating the YAML manifest location alone does not rewrite paths inside a manifest. Prepare manifests with recording paths and speaker-annotated supervisions before training.
 
 ## Training
 
@@ -83,7 +83,7 @@ bash scripts/train_AliMeeting_qwen25_omni_7b_crossattn.sh \
 
 These scripts launch one process and accept additional Hydra overrides. AMI inherits the AliMeeting cross-attention configuration, which inherits `configs/train.yaml`; retain all three files. Numeric anchor embeddings are generated from the active Omni decoder during training and saved with the experiment. No separate anchor-generation command is needed for this configuration.
 
-The full configuration enables temporal convolution, sinusoidal speaker kernels, cross-attention with an MLP adapter, and boundary supervision. The `boundary_only`, `kernel_temporal_no_boundary`, `kernel_boundary_no_temporal_convolution`, and `temporal_boundary_no_kernel` configurations provide component ablations. Older Qwen3 and CTC launchers are not entry points for this model release.
+The provided configuration enables temporal convolution, sinusoidal speaker kernels, cross-attention with an MLP adapter, and boundary supervision.
 
 ## Decoding
 
@@ -106,9 +106,18 @@ Alternatively, select an existing checkpoint by filename:
 python decode.py checkpoint.filename=checkpoint-28000.pt
 ```
 
-`checkpoint.filename` takes precedence over iteration/epoch averaging. `bash scripts/decode_AMI.sh` uses the same default experiment and accepts these overrides. For AliMeeting, also override `exp_dir` and `data.test_data_config` with the corresponding AliMeeting paths.
+`checkpoint.filename` takes precedence over iteration/epoch averaging. For AliMeeting, also override `exp_dir` and `data.test_data_config` with the corresponding AliMeeting paths.
 
 When moving a trained experiment to another machine, update `qwen2_5_omni_pretrained_model` in its saved `config.json`. Keep its tokenizer files, `digit_embeddings.pt`, encoder configurations and weights, and selected model/trainer checkpoints available. Saved experiment files are separate from the source YAML configuration.
+
+## WAV inference
+
+```bash
+python inference.py /path/to/audio.wav \
+  --model /path/to/exported-model
+```
+
+The exported model directory must contain `model.pt` or `model.safetensors` plus its config, tokenizer, numeric embeddings, and required encoder assets. Use `decode.py` for trainer-checkpoint averaging and manifest-based evaluation.
 
 ## Output and evaluation
 

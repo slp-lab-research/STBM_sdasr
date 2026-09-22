@@ -1,9 +1,0 @@
-# List of validation manifests
-# - name: dev
-#   manifest: /abs/path/to/dev_cuts.jsonl.gz
-#   lang: zh
-
-# Example:
-- name: aishell1-test
-  manifest: configs/manifests/aishell1_naive_asr.jsonl.gz
-  lang: zh

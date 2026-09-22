@@ -1,5 +1,0 @@
-# List of training manifests
-# - manifest: /abs/path/to/train_cuts.jsonl.gz
-#   hours: 100.0
-#   weights: 1
-#   lang: zh

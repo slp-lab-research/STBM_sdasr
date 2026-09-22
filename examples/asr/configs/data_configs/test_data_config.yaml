@@ -1,7 +1,0 @@
-# Example test data config for decoding/evaluation.
-# Schema: list of entries with fields:
-# - name: short dataset tag for logging/results
-# - manifest: absolute path to a Lhotse CutSet manifest (jsonl.gz)
-
-- name: demo
-  manifest: /abs/path/to/test_cuts.jsonl.gz
