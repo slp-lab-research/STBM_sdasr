@@ -3,7 +3,6 @@
 This release contains the STBM model implementation and the Auden library it uses.
 
 - [Model README: setup, training, inference, and evaluation](examples/tagspeech/README.md)
-- [Auden introduction](tutorials/introduction.md)
 - [License](LICENSE)
 - [Third-party notices](NOTICE)
 
