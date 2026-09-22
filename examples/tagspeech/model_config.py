@@ -11,31 +11,9 @@ from auden.models.lalm.model_config import LalmConfig
 
 
 class TagSpeechBaseConfig(LalmConfig):
-    """Configuration for AudioLLM with dual audio tokens and separate projectors.
+    """Configuration for dual audio encoders and separate projectors.
 
-    Architecture:
-        Audio Input
-            ↓
-        ┌─────────────┬─────────────┐
-        │             │             │
-    Semantic Encoder  Voice Encoder
-        │             │
-        ↓             ↓
-    Projector1    Projector2
-        │             │
-        ↓             ↓
-    [B,L1,D_llm]  [B,L2,D_llm]
-        │             │
-        └─────┬───────┘
-              │
-        Text: "text <|AUDIO|> speaker <|AUDIO|>"
-              │             │
-              ↓             ↓
-        Semantic Embedding Voice Embedding
-              │             │
-              └─────┬───────┘
-                    │
-                  LLM
+    TagSpeechConfig adds numeric anchors and the speaker-conditioning pipeline.
     """
 
     model_type: str = "tagspeech-base"
@@ -64,11 +42,12 @@ class TagSpeechBaseConfig(LalmConfig):
 
 
 class TagSpeechConfig(TagSpeechBaseConfig):
-    """Dual-audio-tokens model that inserts numeric anchors derived from digit embeddings.
+    """Configuration for semantic anchors and sinusoidal speaker conditioning.
 
-    Similar to the anchor_text model, but anchors consist of character embeddings from natural number
-    sequences (1, 2, 3, ...), ensuring that semantic/voice branches insert the same numbered anchors
-    at the same real-time positions for precise time alignment.
+    The main pipeline inserts decoder-derived numeric anchors into semantic
+    features. Speaker features pass through temporal convolution and the
+    sinusoidal kernel, then supply cross-attention keys and values. An MLP
+    residual produces the single conditioned semantic stream sent to the LLM.
 
     Ordered = speaker slots assigned by first appearance in each recording
     (first speaker = 0, second speaker = 1, etc.); returning speakers keep

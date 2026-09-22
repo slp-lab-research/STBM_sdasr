@@ -23,31 +23,11 @@ from modules import (
 
 
 class TagSpeechBaseModel(LalmModel):
-    """TagSpeech base model with dual audio encoders and separate projectors.
+    """Dual audio encoders, separate projectors, and LLM integration.
 
-    Architecture:
-        Audio Input
-            ↓
-        ┌─────────────┬─────────────┐
-        │             │             │
-    Semantic Encoder  Voice Encoder
-        │             │
-        ↓             ↓
-    Projector1    Projector2
-        │             │
-        ↓             ↓
-    [B,L1,D_llm]  [B,L2,D_llm]
-        │             │
-        └─────┬───────┘
-              │
-        Text: "text <|AUDIO|> speaker <|AUDIO|>"
-              │             │
-              ↓             ↓
-        Semantic Embedding Voice Embedding
-              │             │
-              └─────┬───────┘
-                    │
-                  LLM
+    TagSpeechModel adds semantic anchors and speaker conditioning. The main
+    cross-attention configuration sends one conditioned semantic stream to
+    the LLM using the prompt <audio><|AUDIO|></audio>.
     """
 
     def __init__(self, config, tokenizer, pretrained_llm=None):
@@ -793,18 +773,36 @@ class TagSpeechBaseModel(LalmModel):
 
 
 class TagSpeechModel(TagSpeechBaseModel):
-    """TagSpeech model with numeric time anchors for temporal alignment.
+    """TagSpeech with semantic numeric anchors and speaker conditioning.
 
-    This model inserts numeric anchors (1, 2, 3, ...) at regular intervals in both
-    semantic and voice feature streams. The anchors use digit embeddings obtained
-    through lookup tables, ensuring both branches insert the same numbered anchors
-    at the same real-time positions to improve temporal alignment capability.
+    Main configuration:
+        Audio -> semantic encoder -> projector -> numeric anchors -> queries
+        Audio -> voice encoder -> projector -> temporal convolution + residual
+                                            -> sinusoidal speaker kernel
+                                                |              |
+                                                v              v
+                                          boundary head    keys/values
+                                                |              |
+                                          boundary loss   cross-attention
+                                                               |
+                                                           MLP adapter
+                                                               |
+                                              residual to semantic features
+                                                               |
+                                                          LLM
+                                                               |
+                                                   timestamped text/speakers
+
+    Numeric anchors come from the active decoder's digit embeddings and are
+    inserted into semantic features before cross-attention. The speaker kernel
+    processes speaker features only. The LLM receives one conditioned stream.
+    Boundary loss is computed in trainer.py. Legacy paths remain configurable.
 
     Args:
-        config: Model configuration
-        tokenizer: Tokenizer instance
-        digit_embeddings: Optional dict containing 'embeddings' (Tensor) and 'tokens' (List[str]).
-                         If not provided, will be loaded in from_pretrained().
+        config: Model configuration.
+        tokenizer: Tokenizer instance.
+        digit_embeddings: Dict with 'embeddings' and 'tokens'; required by the
+            constructor or loaded by from_pretrained().
     """
 
     def __init__(self, config, tokenizer, digit_embeddings=None, pretrained_llm=None):
