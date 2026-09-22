@@ -14,6 +14,31 @@ class TagSpeechBaseConfig(LalmConfig):
     """Configuration for dual audio encoders and separate projectors.
 
     TagSpeechConfig adds numeric anchors and the speaker-conditioning pipeline.
+
+    Main TagSpeechModel pipeline:
+                         Audio input
+                        /           \
+             Semantic encoder     Voice encoder
+                     |                  |
+             Semantic projector   Voice projector
+                     |                  |
+              Numeric anchors     Temporal convolution + residual
+                     |                  |
+                    H_sem         Sinusoidal speaker kernel
+                     |                  |           \
+                  Queries          Keys/values    Boundary head
+                      \                /                |
+                       Cross-attention              Boundary loss
+                              |
+                          MLP adapter
+                              |
+                      Add residual H_sem
+                              |
+                  Single conditioned audio stream
+                              |
+                             LLM
+                              |
+                  Timestamped text and speakers
     """
 
     model_type: str = "tagspeech-base"
