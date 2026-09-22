@@ -8,6 +8,7 @@ import logging
 import random
 
 import torch
+import torch.nn.functional as F
 from utils.xml_utils import construct_multi_speaker_xml
 
 from auden.trainer.ddp_trainer import BaseTrainer
@@ -47,10 +48,14 @@ class TagSpeechTrainer(BaseTrainer):
         messages = []
 
         for i, cut in enumerate(cuts):
-            # Dual audio tokens model: use two audio tokens
-            user_content = (
-                f"<text>{audio_token}</text>\n<speaker>{audio_token}</speaker>"
-            )
+            # Kernel pipeline: single-stream audio prompt.
+            if self.cfg.model.get("use_segment_speaker_kernel", False):
+                user_content = f"<audio>{audio_token}</audio>"
+            else:
+                user_content = (
+                    f"<text>{audio_token}</text>\n"
+                    f"<speaker>{audio_token}</speaker>"
+                )
 
             # Construct multi-speaker XML target from cut supervisions (with caching)
             target_xml = self._construct_multi_speaker_xml(cut)
@@ -63,21 +68,93 @@ class TagSpeechTrainer(BaseTrainer):
         with torch.set_grad_enabled(is_training):
             # Get max_length from config if available
             max_length = getattr(self.model.config, "max_length", 800)
+            # Kernel, MLP, and temporal convolution run inside the model.
             model_outputs, acc = self.model(
                 x=feature,
                 x_lens=feature_lens,
                 messages=messages,
                 max_length=max_length,
             )
-            loss = model_outputs.loss
+            # XML/LLM loss: token cross-entropy.
+            shift_logits = model_outputs.logits[:, :-1, :].contiguous()
+            training_labels = model_outputs.get("training_labels")
+            shift_labels = (
+                training_labels[:, 1:].contiguous()
+                if training_labels is not None
+                else None
+            )
+            if shift_labels is None:
+                # Hugging Face causal-LM outputs do not retain input labels.
+                llm_loss = model_outputs.loss
+            else:
+                llm_loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
+
+            # Boundary loss: masked binary cross-entropy.
+            boundary_logits = model_outputs.get("boundary_logits")
+            segment_padding_mask = model_outputs.get("segment_padding_mask")
+            use_boundary_loss = bool(
+                self.cfg.model.get("use_boundary_loss", False)
+            )
+            if use_boundary_loss:
+                if boundary_logits is None or segment_padding_mask is None:
+                    raise RuntimeError(
+                        "Boundary loss is enabled but boundary outputs are missing"
+                    )
+                boundary_targets = self._build_speaker_change_targets(
+                    cuts=cuts,
+                    segment_lens=model_outputs["segment_lens"],
+                    max_segments=boundary_logits.size(1),
+                    device=boundary_logits.device,
+                )
+                valid_boundary_mask = ~segment_padding_mask
+                boundary_loss = F.binary_cross_entropy_with_logits(
+                    boundary_logits[valid_boundary_mask],
+                    boundary_targets[valid_boundary_mask],
+                )
+            else:
+                # No boundary contribution when disabled.
+                boundary_loss = llm_loss.new_zeros(())
+            # Total loss: weighted XML/LLM and boundary losses.
+            llm_weight = float(
+                self.cfg.trainer.get("llm_loss_weight", 1.0)
+            )
+            boundary_weight = float(
+                self.cfg.trainer.get("boundary_loss_weight", 1.0)
+            )
+            loss = llm_weight * llm_loss + boundary_weight * boundary_loss
 
         assert loss.requires_grad == is_training
 
+        # Batch metrics.
         info = MetricsTracker()
         num_frames = sum(len(text) for text in messages)
         info.set_value("frames", num_frames, normalization="sum")
         info.set_value("samples", batch_size, normalization="sum")
+        # Total weighted loss.
         info.set_value("loss", loss.detach().cpu().item(), normalization="frame_avg")
+        # XML token prediction loss.
+        info.set_value(
+            "llm_loss",
+            llm_loss.detach().cpu().item(),
+            normalization="frame_avg",
+        )
+        # Alias of llm_loss; same value.
+        info.set_value(
+            "xml_loss",
+            llm_loss.detach().cpu().item(),
+            normalization="frame_avg",
+        )
+        # Unweighted boundary loss.
+        info.set_value(
+            "boundary_loss",
+            boundary_loss.detach().cpu().item(),
+            normalization="frame_avg",
+        )
+        # Token prediction accuracy.
         info.set_value("acc", acc, normalization="sample_avg")
 
         # Explicit cleanup to prevent memory leaks
@@ -86,6 +163,52 @@ class TagSpeechTrainer(BaseTrainer):
             torch.cuda.empty_cache()
 
         return loss, info
+
+
+    # Boundary targets: mark speaker changes.
+    @staticmethod
+    def _build_speaker_change_targets(
+        cuts,
+        segment_lens: torch.Tensor,
+        max_segments: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Map chronological speaker changes onto the shared segment grid."""
+        targets = torch.zeros(
+            len(cuts), max_segments, dtype=torch.float32, device=device
+        )
+        for batch_idx, cut in enumerate(cuts):
+            num_segments = int(segment_lens[batch_idx].item())
+            duration = float(cut.duration)
+            if num_segments <= 0 or duration <= 0:
+                continue
+
+            supervisions = sorted(
+                cut.supervisions,
+                key=lambda supervision: (
+                    float(supervision.start),
+                    float(supervision.duration),
+                ),
+            )
+            previous_speaker = None
+            for supervision in supervisions:
+                speaker = supervision.speaker
+                if (
+                    previous_speaker is not None
+                    and speaker is not None
+                    and speaker != previous_speaker
+                ):
+                    relative_start = min(
+                        max(float(supervision.start), 0.0), duration
+                    )
+                    segment_idx = min(
+                        int(relative_start / duration * num_segments),
+                        num_segments - 1,
+                    )
+                    targets[batch_idx, segment_idx] = 1.0
+                if speaker is not None:
+                    previous_speaker = speaker
+        return targets
 
     def _construct_multi_speaker_xml(self, cut):
         """Construct XML format target from cut with multiple supervisions.

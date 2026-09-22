@@ -127,12 +127,39 @@ class BaseTrainer(ABC):
             - Model averaging is only created on rank 0 to save memory
             - Parameter statistics are logged for monitoring
         """
-        if self.rank == 0:
+        if self.rank == 0 and self.cfg.trainer.get("use_averaged_model", False):
             model_avg = copy.deepcopy(model).to(torch.float64).to("cpu")
         else:
             model_avg = None
 
+        # === CUDA VRAM TELEMETRY: MODEL LOAD START ===
+        if self.rank == 0 and torch.cuda.is_available():
+            gib = float(1024**3)
+            logging.info(
+                "VRAM before model.to(cuda): allocated=%.2f GiB, reserved=%.2f GiB, "
+                "peak_allocated=%.2f GiB, peak_reserved=%.2f GiB",
+                torch.cuda.memory_allocated(self.device) / gib,
+                torch.cuda.memory_reserved(self.device) / gib,
+                torch.cuda.max_memory_allocated(self.device) / gib,
+                torch.cuda.max_memory_reserved(self.device) / gib,
+            )
+        # === CUDA VRAM TELEMETRY: MODEL LOAD END ===
+
         model = model.to(self.device)
+
+        # === CUDA VRAM TELEMETRY: MODEL LOADED START ===
+        if self.rank == 0 and torch.cuda.is_available():
+            gib = float(1024**3)
+            logging.info(
+                "VRAM after model.to(cuda): allocated=%.2f GiB, reserved=%.2f GiB, "
+                "peak_allocated=%.2f GiB, peak_reserved=%.2f GiB, device_total=%.2f GiB",
+                torch.cuda.memory_allocated(self.device) / gib,
+                torch.cuda.memory_reserved(self.device) / gib,
+                torch.cuda.max_memory_allocated(self.device) / gib,
+                torch.cuda.max_memory_reserved(self.device) / gib,
+                torch.cuda.get_device_properties(self.device).total_memory / gib,
+            )
+        # === CUDA VRAM TELEMETRY: MODEL LOADED END ===
         if self.world_size > 1:
             model = DDP(
                 model,
@@ -666,6 +693,29 @@ class BaseTrainer(ABC):
         with torch.amp.autocast("cuda", enabled=self.use_fp16):
             loss, batch_metrics = self._forward_one_batch(batch=batch, is_training=True)
 
+        if not torch.isfinite(loss):
+            supervisions = batch.get("supervisions", {})
+            cuts = supervisions.get("cut", [])
+            cut_ids = [getattr(cut, "id", "<unknown>") for cut in cuts]
+            inputs = batch.get("inputs")
+            input_summary = "unavailable"
+            if isinstance(inputs, torch.Tensor):
+                finite_inputs = torch.isfinite(inputs)
+                input_summary = (
+                    f"shape={tuple(inputs.shape)}, "
+                    f"all_finite={bool(finite_inputs.all().item())}"
+                )
+                if finite_inputs.any():
+                    finite_values = inputs[finite_inputs]
+                    input_summary += (
+                        f", finite_min={finite_values.min().item():.6g}, "
+                        f"finite_max={finite_values.max().item():.6g}"
+                    )
+            raise RuntimeError(
+                f"Non-finite loss at global_step={self.global_step}: {loss.item()}; "
+                f"cut_ids={cut_ids}; inputs=({input_summary})"
+            )
+
         # Backprop and optimization step
         self.scaler.scale(loss).backward()
         self.scheduler.step_batch(self.global_step)
@@ -811,12 +861,41 @@ class BaseTrainer(ABC):
         cur_lr = max(self.scheduler.get_last_lr())
         cur_grad_scale = self.scaler.get_scale() if self.use_fp16 else 1.0
 
+        # === CUDA VRAM TELEMETRY START ===
+        # Report both live usage and the high-water mark for the entire job.
+        # "allocated" is memory occupied by tensors; "reserved" additionally
+        # includes PyTorch's CUDA caching allocator. Values are per local GPU.
+        cuda_memory_text = ""
+        cuda_memory = None
+        # Normal training status is logged every log_interval, but VRAM is
+        # intentionally sampled only every 10,000 batches to keep logs compact.
+        if torch.cuda.is_available() and batch_idx % 10000 == 0:
+            device = self.device
+            gib = float(1024**3)
+            cuda_memory = {
+                "allocated_gib": torch.cuda.memory_allocated(device) / gib,
+                "reserved_gib": torch.cuda.memory_reserved(device) / gib,
+                "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / gib,
+                "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / gib,
+                "total_gib": torch.cuda.get_device_properties(device).total_memory / gib,
+            }
+            cuda_memory_text = (
+                ", VRAM["
+                f"allocated={cuda_memory['allocated_gib']:.2f} GiB, "
+                f"reserved={cuda_memory['reserved_gib']:.2f} GiB, "
+                f"peak_allocated={cuda_memory['peak_allocated_gib']:.2f} GiB, "
+                f"peak_reserved={cuda_memory['peak_reserved_gib']:.2f} GiB, "
+                f"device_total={cuda_memory['total_gib']:.2f} GiB]"
+            )
+        # === CUDA VRAM TELEMETRY END ===
+
         logging.info(
             f"Epoch {epoch}, "
             f"batch {batch_idx}, info[{batch_metrics}], "
             f"tot_info[{total_metrics}], batch size: {batch_size}, "
             f"lr: {cur_lr:.2e}, "
             + (f"grad_scale: {cur_grad_scale}" if self.use_fp16 else "")
+            + cuda_memory_text
         )
 
         if self.tb_writer is not None:
@@ -825,6 +904,13 @@ class BaseTrainer(ABC):
                 self.tb_writer.add_scalar(
                     "train/grad_scale", cur_grad_scale, self.global_step
                 )
+            # === CUDA VRAM TELEMETRY START ===
+            if cuda_memory is not None:
+                for name, value in cuda_memory.items():
+                    self.tb_writer.add_scalar(
+                        f"train/vram_{name}", value, self.global_step
+                    )
+            # === CUDA VRAM TELEMETRY END ===
 
             batch_metrics.write_summary(
                 self.tb_writer, "train/current_", self.global_step

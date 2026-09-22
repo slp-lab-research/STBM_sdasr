@@ -1,0 +1,18 @@
+defaults:
+  - train_qwen25_omni_7b_boundary_only_alimeeting
+  - _self_
+
+exp_dir: experiments/diarization_AMI_boundary_only_qwen25_omni_7b
+
+model:
+  audio_encoder:
+    pretrained_model: experiments/diarization_AMI/audio_encoder/model_ami_audio.safetensors
+    frozen: true
+  voice_encoder:
+    pretrained_model: experiments/diarization_AMI/voice_encoder/model_ami_voice.safetensors
+    frozen: true
+
+data:
+  train_data_config: configs/AMI/data_configs/train_data_config.yaml
+  valid_data_config: configs/AMI/data_configs/valid_data_config.yaml
+  channel: 0

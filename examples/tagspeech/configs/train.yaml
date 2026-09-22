@@ -1,4 +1,7 @@
-exp_dir: experiments/tagspeech
+# Replace /path/to/... with local paths; relative paths start at examples/tagspeech.
+seed: 114514
+
+exp_dir: experiments/diarization_AMI
 hydra:
   run:
     dir: ${exp_dir}/logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
@@ -8,17 +11,19 @@ model:
 
   audio_encoder:
     model_type: zipformer
-    pretrained_model: /zipformer-encoder-zh-en # folder to local model or Hugging Face model name
+    pretrained_model: experiments/diarization_AMI/audio_encoder/model_ami_audio.safetensors
     frozen: True
 
   voice_encoder:
     model_type: zipformer
-    pretrained_model: /speaker_encoder # folder to local model or Hugging Face model name
+    pretrained_model: experiments/diarization_AMI/voice_encoder/model_ami_voice.safetensors
     frozen: True
 
   llm:
-    model_type: qwen2
-    pretrained_model: /Qwen2.5-7B-Instruct # folder to local model or Hugging Face model name
+    model_type: qwen2_5_omni
+    # Replace with the complete local Qwen2.5 Omni checkpoint directory.
+    pretrained_model: /path/to/Qwen2.5-Omni-7B
+    dtype: bfloat16
     use_flash_attn: False
     frozen: True
 
@@ -35,7 +40,21 @@ model:
   semantic_anchor_interval: 8
   voice_anchor_interval: 8
   insert_anchors_at_ends: True
-  digit_embedding_path: utils/digit_token_embeddings.pt
+  digit_embedding_path: utils/digit_embeddings.pt
+
+  # === ORDERED SPEAKER KERNEL CONFIG ===
+  # Experimental single-stream path: pool both projected streams on the same
+  # temporal grid, inject speaker information into semantic segments, then
+  # insert numeric anchors and send the conditioned sequence to the LLM.
+  use_segment_speaker_kernel: True
+  ordered_kernel_num_speakers: 4
+  ordered_kernel_probability_hidden_dim: null
+  ordered_kernel_probability_dropout: 0.1
+  ordered_kernel_scale: 0.1
+  ordered_kernel_learnable_scale: True
+  ordered_kernel_normalize_semantic: False
+  use_boundary_loss: False
+  # === END ORDERED SPEAKER KERNEL CONFIG ===
 
   exclude_from_checkpoint:
     - audio_encoder
@@ -72,11 +91,12 @@ data:
   on_the_fly_feats: True
   feature: fbank
   sampling_rate: 16000
+  channel: 0
   use_infinite_dataset: True
   data_augmentation:
     enable_spec_aug: True
     enable_musan: False
-    musan: 
+    musan:
     enable_speed_perturb: False
   sampler:
     type: bucketing_sampler
@@ -89,5 +109,3 @@ data:
   num_workers: 1
 
 prompt_file: configs/prompt.yaml
-
-

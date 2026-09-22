@@ -4,4 +4,6 @@
 # https://lhotse.readthedocs.io/en/latest/api.html#lhotse.cut.MultiCut.trim_to_supervision_groups
 
 - name: ami-valid-utterance-group
-  manifest: /AMI_manifests/ami-sdm_dev_multiASR.jsonl.gz
+  # Relative to examples/tagspeech; use an absolute path if stored elsewhere.
+  manifest: AMI_manifests/ami-sdm_dev_multiASR.jsonl.gz
+  lang: en

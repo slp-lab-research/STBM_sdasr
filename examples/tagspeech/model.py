@@ -4,7 +4,6 @@ import logging
 from typing import Dict, List
 
 import torch
-import torch.nn as nn
 
 from auden.auto.auto_model import AutoModel
 from auden.models.lalm.model import (
@@ -13,16 +12,14 @@ from auden.models.lalm.model import (
     EncoderProjector,
     LalmModel,
     compute_accuracy,
+    get_llm_hidden_size,
 )
 
-# Qwen-3 chat template
-CHAT_TEMPLATE_3 = """{% for message in messages %}
-<|im_start|>{{ message['role'] }}
-{{ message['content'] }}<|im_end|>
-{% endfor %}
-{% if add_generation_prompt %}
-<|im_start|>assistant
-{% endif %}"""
+# Kernel conditioners
+from modules import (
+    SharedSegmentSpeakerConditioner,
+    SpeakerKernelCrossAttentionConditioner,
+)
 
 
 class TagSpeechBaseModel(LalmModel):
@@ -53,9 +50,9 @@ class TagSpeechBaseModel(LalmModel):
                   LLM
     """
 
-    def __init__(self, config, tokenizer):
+    def __init__(self, config, tokenizer, pretrained_llm=None):
         # First initialize parent class (creates semantic encoder, llm, etc.)
-        super().__init__(config, tokenizer)
+        super().__init__(config, tokenizer, pretrained_llm=pretrained_llm)
 
         # Note: parent class has created self.audio_encoder (semantic encoder)
         # Now we add voice encoder
@@ -88,44 +85,20 @@ class TagSpeechBaseModel(LalmModel):
         # Create semantic projector
         self.semantic_projector = EncoderProjector(
             self.audio_encoder_dim,  # 768
-            self.llm.config.hidden_size,  # D_llm
+            get_llm_hidden_size(self.llm.config),  # D_llm, including Omni Thinker
             config.semantic_projector_ds_rate,
         )
+
 
         # Create voice projector
         self.voice_projector = EncoderProjector(
             self.voice_encoder_dim,  # 768
-            self.llm.config.hidden_size,  # D_llm
+            get_llm_hidden_size(self.llm.config),  # D_llm, including Omni Thinker
             config.voice_projector_ds_rate,
         )
 
     def _get_chat_template(self):
-        """Auto-select chat template based on LLM model type."""
-        # Check LLM config for model type
-        llm_config = self.llm.config
-
-        # Check for Qwen-3 models
-        if hasattr(llm_config, "architectures") and llm_config.architectures:
-            if any("Qwen3" in arch for arch in llm_config.architectures):
-                return CHAT_TEMPLATE_3
-
-        # Check for Qwen-2 models
-        if hasattr(llm_config, "model_type"):
-            if (
-                "qwen2" in llm_config.model_type.lower()
-                or "qwen-2" in llm_config.model_type.lower()
-            ):
-                return CHAT_TEMPLATE
-
-        # Check for Qwen-3 in model_type
-        if hasattr(llm_config, "model_type"):
-            if (
-                "qwen3" in llm_config.model_type.lower()
-                or "qwen-3" in llm_config.model_type.lower()
-            ):
-                return CHAT_TEMPLATE_3
-
-        # Default to original template
+        """Use the Qwen2.5 chat template."""
         return CHAT_TEMPLATE
 
     def forward_audio_features(self, x: torch.Tensor, x_lens: torch.Tensor):
@@ -158,14 +131,15 @@ class TagSpeechBaseModel(LalmModel):
         # 2. Dual projectors
         # ========================================
         # Semantic projector
-        semantic_features = self.semantic_projector(semantic_outs).to(torch.float16)
+        semantic_features = self.semantic_projector(semantic_outs)
         semantic_lens = semantic_feature_lens // self.config.semantic_projector_ds_rate
 
         # Voice projector
-        voice_features = self.voice_projector(voice_outs).to(torch.float16)
+        voice_features = self.voice_projector(voice_outs)
         voice_lens = voice_feature_lens // self.config.voice_projector_ds_rate
 
         return semantic_features, voice_features, semantic_lens, voice_lens
+
 
     def forward(
         self,
@@ -180,11 +154,14 @@ class TagSpeechBaseModel(LalmModel):
             self.forward_audio_features(x, x_lens)
         )
 
+        # import pdb
+        # pdb.set_trace()
+
         # Pass both features as a tuple for dual encoder preprocessing
         audio_features = (semantic_features, voice_features, semantic_lens, voice_lens)
 
         # Use the dual encoder preprocessing
-        input_ids, inputs_embeds, attention_mask, labels = (
+        input_ids, inputs_embeds, attention_mask, labels, position_ids = (
             self.preprocess_text_and_audio(
                 messages,
                 audio_features=audio_features,
@@ -195,9 +172,30 @@ class TagSpeechBaseModel(LalmModel):
             )
         )
 
+        llm_compute_dtype = self.llm.model.layers[0].self_attn.q_proj.weight.dtype
+        inputs_embeds = inputs_embeds.to(dtype=llm_compute_dtype)
+        attention_mask = attention_mask.to(dtype=llm_compute_dtype)
+        # XML/LLM loss: labels supervise token prediction.
         outputs = self.llm(
-            inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            labels=labels,
+            position_ids=position_ids,
         )
+        outputs["training_labels"] = labels
+
+        segment_outputs = getattr(self, "_last_segment_outputs", None)
+        if (
+            segment_outputs is not None
+            and "boundary_logits" in segment_outputs
+        ):
+            # Boundary outputs for the trainer's BCE loss.
+            outputs["boundary_logits"] = segment_outputs["boundary_logits"]
+            outputs["boundary_probs"] = segment_outputs["boundary_probs"]
+            outputs["segment_lens"] = segment_outputs["segment_lens"]
+            outputs["segment_padding_mask"] = segment_outputs[
+                "segment_padding_mask"
+            ]
         with torch.no_grad():
             preds = torch.argmax(outputs.logits, -1)
             acc = compute_accuracy(
@@ -213,8 +211,29 @@ class TagSpeechBaseModel(LalmModel):
         max_length=192,
         tag_audio_boundary=False,
         is_training=False,
+        pack_sequences=True,
+        max_total_length=None,
     ):
         """Override parent method to handle dual encoder tokens."""
+        # Pass conditioned semantic features to the LLM as one audio stream.
+        # In the current pipeline, cross-attention has already fused the streams.
+        if (
+            audio_features is not None
+            and len(audio_features) == 4
+            and getattr(self.config, "use_segment_speaker_kernel", False)
+        ):
+            semantic_features, _, semantic_lens, _ = audio_features
+            return super().preprocess_text_and_audio(
+                messages=messages,
+                audio_features=semantic_features,
+                audio_feature_lens=semantic_lens,
+                max_length=max_length,
+                tag_audio_boundary=tag_audio_boundary,
+                is_training=is_training,
+                pack_sequences=pack_sequences,
+                max_total_length=max_total_length,
+            )
+
         # For dual encoder model, we need to handle two separate audio features
         if audio_features is not None and len(audio_features) == 4:
             # audio_features is a tuple: (semantic_features, voice_features, semantic_lens, voice_lens)
@@ -234,12 +253,14 @@ class TagSpeechBaseModel(LalmModel):
         else:
             # Fallback to parent method for single audio token
             return super().preprocess_text_and_audio(
-                messages,
-                audio_features,
-                audio_feature_lens,
-                max_length,
-                tag_audio_boundary,
-                is_training,
+                messages=messages,
+                audio_features=audio_features,
+                audio_feature_lens=audio_feature_lens,
+                max_length=max_length,
+                tag_audio_boundary=tag_audio_boundary,
+                is_training=is_training,
+                pack_sequences=pack_sequences,
+                max_total_length=max_total_length,
             )
 
     def _preprocess_dual_audio_tokens(
@@ -485,8 +506,10 @@ class TagSpeechBaseModel(LalmModel):
             labels = None
 
         attention_mask = (~padding_mask).to(input_embeds.dtype)
+        position_ids = attention_mask.to(torch.long).cumsum(dim=-1) - 1
+        position_ids.masked_fill_(padding_mask, 0)
 
-        return input_ids, input_embeds, attention_mask, labels
+        return input_ids, input_embeds, attention_mask, labels, position_ids
 
     def generate(self, input, messages, max_length=None, **kwargs):
         """Override parent generate to handle dual encoder features."""
@@ -520,20 +543,36 @@ class TagSpeechBaseModel(LalmModel):
         if preprocess_max_length is None:
             preprocess_max_length = getattr(self.config, "inference_max_length", None)
 
-        input_ids, inputs_embeds, attention_mask, _ = self.preprocess_text_and_audio(
-            messages,
-            audio_features=audio_features,
-            audio_feature_lens=None,  # Not used in dual mode
-            max_length=preprocess_max_length,
-            is_training=False,
-            tag_audio_boundary=self.config.tag_audio_boundary,
+        input_ids, inputs_embeds, attention_mask, _, position_ids = (
+            self.preprocess_text_and_audio(
+                messages,
+                audio_features=audio_features,
+                audio_feature_lens=None,  # Not used in dual mode
+                max_length=preprocess_max_length,
+                is_training=False,
+                tag_audio_boundary=self.config.tag_audio_boundary,
+                # Generation extends a 2-D padding mask token by token. The
+                # packed SDPA training mask is 4-D and cannot be extended by
+                # Hugging Face generation utilities.
+                pack_sequences=False,
+            )
         )
+        llm_compute_dtype = self.llm.model.layers[0].self_attn.q_proj.weight.dtype
+        inputs_embeds = inputs_embeds.to(dtype=llm_compute_dtype)
+        attention_mask = attention_mask.to(dtype=llm_compute_dtype)
         generated_ids = self.llm.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            bos_token_id=self.llm.config.bos_token_id,
-            eos_token_id=self.llm.config.eos_token_id,
-            pad_token_id=self.pad_token_id,
+            position_ids=position_ids,
+            bos_token_id=getattr(
+                self.llm.config, "bos_token_id", self.tokenizer.bos_token_id
+            ),
+            eos_token_id=getattr(
+                self.llm.config, "eos_token_id", self.tokenizer.eos_token_id
+            ),
+            pad_token_id=getattr(
+                self.llm.config, "pad_token_id", self.tokenizer.pad_token_id
+            ),
             use_cache=True,
             **kwargs,
         )
@@ -624,6 +663,28 @@ class TagSpeechBaseModel(LalmModel):
                     f"[TagSpeech.from_pretrained] digit_embeddings.pt not found in {model_dir}. "
                     "Model initialization may fail if digit_embeddings are required."
                 )
+
+        # Reload the frozen Qwen2.5 Omni Thinker.
+        omni_source = getattr(config, "qwen2_5_omni_pretrained_model", None)
+        if omni_source and "pretrained_llm" not in kwargs:
+            from transformers import Qwen2_5OmniThinkerForConditionalGeneration
+
+            thinker_class = Qwen2_5OmniThinkerForConditionalGeneration
+            omni_thinker = thinker_class.from_pretrained(
+                omni_source,
+                config=config.llm_config,
+                torch_dtype=torch.float16,
+                local_files_only=True,
+            )
+            if hasattr(omni_thinker, "audio_tower"):
+                del omni_thinker.audio_tower
+            if hasattr(omni_thinker, "visual"):
+                del omni_thinker.visual
+            # Restore generation token IDs from the tokenizer.
+            omni_thinker.config.bos_token_id = tokenizer.bos_token_id
+            omni_thinker.config.eos_token_id = tokenizer.eos_token_id
+            omni_thinker.config.pad_token_id = tokenizer.pad_token_id
+            kwargs["pretrained_llm"] = omni_thinker
 
         # Create model
         model = cls(config, tokenizer, **kwargs)
@@ -746,8 +807,8 @@ class TagSpeechModel(TagSpeechBaseModel):
                          If not provided, will be loaded in from_pretrained().
     """
 
-    def __init__(self, config, tokenizer, digit_embeddings=None):
-        super().__init__(config, tokenizer)
+    def __init__(self, config, tokenizer, digit_embeddings=None, pretrained_llm=None):
+        super().__init__(config, tokenizer, pretrained_llm=pretrained_llm)
 
         if digit_embeddings is None:
             raise ValueError(
@@ -786,15 +847,93 @@ class TagSpeechModel(TagSpeechBaseModel):
                 f"Digit embedding missing embeddings for the following characters: {sorted(missing)}"
             )
 
-        if embeddings.shape[1] != self.llm.config.hidden_size:
+        llm_hidden_size = get_llm_hidden_size(self.llm.config)
+        if embeddings.shape[1] != llm_hidden_size:
             logging.warning(
                 "[TagSpeechModel] digit embedding hidden size (%d) does not match LLM hidden size (%d), "
                 "will adapt through runtime cast.",
                 embeddings.shape[1],
-                self.llm.config.hidden_size,
+                llm_hidden_size,
             )
 
         self._anchor_cache: Dict[int, torch.Tensor] = {}
+
+        # Kernel pipeline selection.
+        self.use_segment_speaker_kernel = bool(
+            config.use_segment_speaker_kernel
+        )
+        self.use_speaker_kernel_cross_attention = bool(
+            getattr(config, "use_speaker_kernel_cross_attention", False)
+        )
+        if self.use_segment_speaker_kernel:
+            hidden_size = llm_hidden_size
+            if self.use_speaker_kernel_cross_attention:
+                self.segment_speaker_conditioner = (
+                    # Speaker kernel, temporal convolution, MLP, and boundary head.
+                    SpeakerKernelCrossAttentionConditioner(
+                        semantic_dim=hidden_size,
+                        speaker_dim=hidden_size,
+                        num_speakers=config.ordered_kernel_num_speakers,
+                        # Cross-attention fusion.
+                        attention_heads=getattr(
+                            config, "speaker_kernel_attention_heads", 8
+                        ),
+                        attention_dropout=getattr(
+                            config, "speaker_kernel_attention_dropout", 0.0
+                        ),
+                        # Temporal convolution.
+                        temporal_kernel_size=getattr(
+                            config, "speaker_kernel_temporal_kernel_size", 3
+                        ),
+                        # MLP adapter.
+                        adapter_expansion=getattr(
+                            config, "speaker_kernel_adapter_expansion", 4
+                        ),
+                        adapter_dropout=getattr(
+                            config, "speaker_kernel_adapter_dropout", 0.1
+                        ),
+                        # Component switches.
+                        use_temporal_convolution=getattr(
+                            config, "speaker_kernel_use_temporal_convolution", True
+                        ),
+                        use_speaker_kernel=getattr(
+                            config, "speaker_kernel_enabled", True
+                        ),
+                        use_cross_attention=getattr(
+                            config, "speaker_kernel_cross_attention_enabled", True
+                        ),
+                        # Speaker-only kernel.
+                        probability_hidden_dim=(
+                            config.ordered_kernel_probability_hidden_dim
+                        ),
+                        probability_dropout=(
+                            config.ordered_kernel_probability_dropout
+                        ),
+                        kernel_scale=config.ordered_kernel_scale,
+                        learnable_scale=(
+                            config.ordered_kernel_learnable_scale
+                        ),
+                        # Boundary head; BCE loss is computed in trainer.py.
+                        use_boundary_head=config.use_boundary_loss,
+                    )
+                )
+            else:
+                # Legacy segment conditioner; not selected by the main config.
+                self.segment_speaker_conditioner = SharedSegmentSpeakerConditioner(
+                    semantic_dim=hidden_size,
+                    speaker_dim=hidden_size,
+                    semantic_interval=config.semantic_anchor_interval,
+                    speaker_interval=config.voice_anchor_interval,
+                    num_speakers=config.ordered_kernel_num_speakers,
+                    probability_hidden_dim=(
+                        config.ordered_kernel_probability_hidden_dim
+                    ),
+                    probability_dropout=config.ordered_kernel_probability_dropout,
+                    kernel_scale=config.ordered_kernel_scale,
+                    learnable_scale=config.ordered_kernel_learnable_scale,
+                    normalize_semantic=config.ordered_kernel_normalize_semantic,
+                    use_boundary_head=config.use_boundary_loss,
+                )
 
         logging.info(
             "[TagSpeechModel] Loaded digit embeddings (dtype=%s, shape=%s). "
@@ -805,6 +944,21 @@ class TagSpeechModel(TagSpeechBaseModel):
             config.voice_anchor_interval,
             config.insert_anchors_at_ends,
         )
+        # Log enabled components.
+        if self.use_segment_speaker_kernel:
+            kernel_enabled = bool(
+                getattr(config, "speaker_kernel_enabled", True)
+            )
+            cross_attention_enabled = bool(
+                getattr(config, "speaker_kernel_cross_attention_enabled", True)
+            )
+            logging.info(
+                "[TagSpeechModel] Enabled segment conditioner "
+                "(kernel=%s, cross_attention=%s, boundary_head=%s)",
+                kernel_enabled,
+                cross_attention_enabled,
+                bool(config.use_boundary_loss),
+            )
 
     @staticmethod
     def load_digit_embeddings(path: str) -> dict:
@@ -926,13 +1080,38 @@ class TagSpeechModel(TagSpeechBaseModel):
         return new_feats, new_lens_tensor
 
     def _forward_dual_audio_features(self, x: torch.Tensor, x_lens: torch.Tensor):
+        self._last_segment_outputs = None
         semantic_features, voice_features, semantic_lens, voice_lens = (
             super()._forward_dual_audio_features(x, x_lens)
         )
 
+
         semantic_features, semantic_lens = self._insert_numeric_anchors(
-            semantic_features, semantic_lens, self.config.semantic_anchor_interval
+            semantic_features,
+            semantic_lens,
+            self.config.semantic_anchor_interval,
         )
+
+
+        # Run temporal convolution, speaker kernel, cross-attention, and MLP.
+        # Semantic anchors supply the cross-attention queries.
+        if self.use_segment_speaker_kernel:
+            conditioned_semantic, conditioned_lens, segment_outputs = (
+                self.segment_speaker_conditioner(
+                    semantic_features=semantic_features,
+                    semantic_lens=semantic_lens,
+                    speaker_features=voice_features,
+                    speaker_lens=voice_lens,
+                )
+            )
+            self._last_segment_outputs = segment_outputs
+            return (
+                conditioned_semantic,
+                voice_features,
+                conditioned_lens,
+                voice_lens,
+            )
+
         voice_features, voice_lens = self._insert_numeric_anchors(
             voice_features, voice_lens, self.config.voice_anchor_interval
         )

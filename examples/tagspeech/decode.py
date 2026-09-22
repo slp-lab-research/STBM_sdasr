@@ -23,6 +23,15 @@ from auden.auto.auto_model import AutoModel
 from auden.utils.checkpoint import generate_model_checkpoint_from_trainer_checkpoints
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def resolve_script_path(path):
+    """Resolve config paths the same way regardless of the launch directory."""
+    path = Path(path).expanduser()
+    return path if path.is_absolute() else SCRIPT_DIR / path
+
+
 def get_test_dataloaders(cfg):
     """Prepare test dataloaders."""
     test_dls = []
@@ -30,14 +39,43 @@ def get_test_dataloaders(cfg):
 
     input_strategy = OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80)))
 
-    with open(cfg.data.test_data_config, "r") as file:
+    test_data_config_path = resolve_script_path(cfg.data.test_data_config)
+    with open(test_data_config_path, "r") as file:
         test_data_config = yaml.load(file, Loader=yaml.FullLoader)
 
     for test_set in test_data_config:
         logging.info(f"Getting {test_set['manifest']} cuts")
-        cutset = CutSet.from_file(test_set["manifest"]).resample(
+        manifest_path = resolve_script_path(test_set["manifest"])
+        cutset = CutSet.from_file(manifest_path).resample(
             getattr(cfg.data, "sampling_rate", 16000)
         )
+        channel = cfg.data.get("channel", None)
+        if channel is not None:
+            logging.info(f"Selecting channel {channel} for multi-channel audio")
+            cutset = cutset.map(lambda c: c.with_channels(channel))
+
+        filter_cut_ids_file = cfg.decode.get("filter_cut_ids_file", None)
+        if filter_cut_ids_file:
+            filter_path = resolve_script_path(filter_cut_ids_file)
+            with open(filter_path, "r", encoding="utf-8") as f:
+                selected_cut_ids = {
+                    line.strip()
+                    for line in f
+                    if line.strip() and not line.lstrip().startswith("#")
+                }
+            cutset = cutset.filter(lambda c: c.id in selected_cut_ids)
+            selected_count = len(cutset)
+            if selected_count == 0:
+                raise ValueError(
+                    f"No cuts matched the IDs in diagnostic filter {filter_path}"
+                )
+            logging.info(
+                "Selected %d/%d requested cuts from %s",
+                selected_count,
+                len(selected_cut_ids),
+                filter_path,
+            )
+
         # Optional decode-time filtering to avoid OOM
         min_dur = cfg.decode.get("min_duration", 0.0) if hasattr(cfg, "decode") else 0.0
         max_dur = (
@@ -71,9 +109,13 @@ def get_test_dataloaders(cfg):
             input_strategy=input_strategy,
             return_cuts=True,
         )
-        sampler = DynamicBucketingSampler(
-            cutset, max_duration=cfg.data.max_duration, shuffle=False
-        )
+        if cfg.decode.get("single_cut_batches", False):
+            logging.info("Using one cut per decode batch")
+            sampler = SimpleCutSampler(cutset, max_cuts=1, shuffle=False)
+        else:
+            sampler = DynamicBucketingSampler(
+                cutset, max_duration=cfg.data.max_duration, shuffle=False
+            )
 
         test_dl = DataLoader(
             testset,
@@ -165,18 +207,19 @@ def main(cfg: DictConfig):
     register_custom_models()
 
     logging.info("\n" + OmegaConf.to_yaml(cfg))
-    set_audio_duration_mismatch_tolerance(0.1)
+    set_audio_duration_mismatch_tolerance(0.5)
 
     # Initialize dataloader
     test_sets, test_dls = get_test_dataloaders(cfg)
 
     # Initialize model
     checkpoint_path = None
+    exp_dir = resolve_script_path(cfg.exp_dir)
     ckpt_cfg = cfg.checkpoint
     filename = ckpt_cfg.get("filename", None)
     if filename:  # it should be the model checkpoint
         checkpoint_path = (
-            filename if os.path.isabs(filename) else os.path.join(cfg.exp_dir, filename)
+            filename if os.path.isabs(filename) else os.path.join(exp_dir, filename)
         )
     else:  # generate the model checkpoint from trainer checkpoints
         avg = ckpt_cfg.get("avg", 0)
@@ -190,10 +233,10 @@ def main(cfg: DictConfig):
             raise ValueError(
                 "When averaging, set either checkpoint.iter or checkpoint.epoch"
             )
-        checkpoint_path = os.path.join(cfg.exp_dir, model_name)
+        checkpoint_path = os.path.join(exp_dir, model_name)
         if not os.path.exists(checkpoint_path):
             generate_model_checkpoint_from_trainer_checkpoints(
-                model_dir=cfg.exp_dir,
+                model_dir=exp_dir,
                 epochs=epoch or None,
                 iters=iters or None,
                 avg=avg,
@@ -206,6 +249,15 @@ def main(cfg: DictConfig):
     )
     model.to(device)
     model.eval()
+    intervention_mode = cfg.decode.get("temporal_intervention", None)
+    intervention_record = None
+    if intervention_mode is not None:
+        from modules.temporal_intervention import apply_temporal_intervention
+
+        intervention_record = apply_temporal_intervention(
+            model.segment_speaker_conditioner, intervention_mode
+        )
+        logging.info("Temporal intervention: %s", intervention_record)
     num_param = sum(p.numel() for p in model.parameters())
     logging.info(f"Number of model parameters: {num_param}")
 
@@ -234,7 +286,7 @@ def main(cfg: DictConfig):
             "top_k": None,
             "temperature": None,
         }
-    res_dir = Path(cfg.exp_dir) / cfg.decoding_method
+    res_dir = exp_dir / cfg.decoding_method
     os.makedirs(res_dir, exist_ok=True)
 
     # Determine results file suffix
@@ -252,16 +304,43 @@ def main(cfg: DictConfig):
     else:
         results_file_suffix = "pretrained"
 
+    output_tag = cfg.decode.get("output_tag", None)
+    if output_tag:
+        results_file_suffix = f"{results_file_suffix}-{output_tag}"
+    if intervention_record is not None:
+        import hashlib
+        import json
+
+        results_file_suffix = f"{results_file_suffix}-temporal-{intervention_mode}"
+        checkpoint_stat = Path(checkpoint_path).stat()
+        intervention_record.update(
+            checkpoint=str(Path(checkpoint_path).resolve()),
+            checkpoint_size=checkpoint_stat.st_size,
+            checkpoint_mtime_ns=checkpoint_stat.st_mtime_ns,
+            model_config_sha256=hashlib.sha256((exp_dir / "config.json").read_bytes()).hexdigest(),
+            generation_config=generate_config,
+            decode_config=OmegaConf.to_container(cfg, resolve=True),
+        )
+        (res_dir / f"intervention-{results_file_suffix}.json").write_text(
+            json.dumps(intervention_record, indent=2)
+        )
+
     # Load prompt
-    with open(cfg.prompt_file, "r", encoding="utf-8") as f:
+    prompt_path = resolve_script_path(cfg.prompt_file)
+    with open(prompt_path, "r", encoding="utf-8") as f:
         prompt_list = [line.strip() for line in f if line.strip()]
     prompt = prompt_list[0] if prompt_list else ""
 
-    # Dual audio tokens model expects two audio tokens
     audio_token = model.config.audio_token
-    user_content_template = (
-        f"<text>{audio_token}</text>\n<speaker>{audio_token}</speaker>"
-    )
+    # === ORDERED SPEAKER KERNEL: single-stream decode prompt ===
+    if getattr(model.config, "use_segment_speaker_kernel", False):
+        user_content_template = f"<audio>{audio_token}</audio>"
+    else:
+        # Legacy dual-stream model expects two audio tokens.
+        user_content_template = (
+            f"<text>{audio_token}</text>\n<speaker>{audio_token}</speaker>"
+        )
+    # === END ORDERED SPEAKER KERNEL: single-stream decode prompt ===
     if prompt:
         user_content_template += f" {prompt}"
 

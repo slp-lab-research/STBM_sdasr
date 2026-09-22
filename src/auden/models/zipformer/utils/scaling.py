@@ -15,13 +15,39 @@
 # limitations under the License.
 
 
+import ctypes
+import importlib
 import logging
 import math
 import random
+import sys
+from pathlib import Path
 from typing import Optional, Tuple, Union
 
+
+def _import_k2():
+    """Import k2, preloading Conda's NVTX library when needed."""
+    try:
+        return importlib.import_module("k2")
+    except ImportError as first_error:
+        if "libnvToolsExt.so.1" not in str(first_error):
+            raise
+
+        candidates = [Path(sys.prefix) / "lib" / "libnvToolsExt.so.1"]
+        candidates.extend(
+            (Path(sys.prefix) / "lib").glob(
+                "python*/site-packages/nvidia/nvtx/lib/libnvToolsExt.so.1"
+            )
+        )
+        for library in candidates:
+            if library.is_file():
+                ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
+                return importlib.import_module("k2")
+        raise first_error
+
+
 try:
-    import k2
+    k2 = _import_k2()
 except Exception as e:  # pragma: no cover
     raise ImportError(
         "k2 is required for Zipformer custom ops (Swoosh*, RNNT helpers). "

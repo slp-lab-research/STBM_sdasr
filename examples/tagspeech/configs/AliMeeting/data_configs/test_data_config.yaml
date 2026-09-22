@@ -1,9 +1,4 @@
-
-# Get the data and manifests from lhotse:
-# https://github.com/lhotse-speech/lhotse/blob/master/lhotse/recipes/alimeeting.py
-# https://lhotse.readthedocs.io/en/latest/api.html#lhotse.cut.MultiCut.trim_to_supervision_groups
-
+# Relative to examples/tagspeech; use an absolute path if stored elsewhere.
+# Audio and feature paths inside the manifest must also exist locally.
 - name: alimeeting-test-utterance-group
-  manifest: /AliMeeting_manifests/alimeeting-far_test_multiASR.jsonl.gz
-
-
+  manifest: AliMeeting_manifests/alimeeting-far_test_multiASR.jsonl.gz

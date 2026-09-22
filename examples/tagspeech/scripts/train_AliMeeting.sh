@@ -1,8 +1,5 @@
 #!/bin/bash
-torchrun --nproc_per_node=1 train.py \
-  exp_dir=experiments/diarization_AliMeeting \
-  data.train_data_config=configs/AliMeeting/data_configs/train_data_config.yaml \
-  data.valid_data_config=configs/AliMeeting/data_configs/valid_data_config.yaml
+set -euo pipefail
 
-  # for better performance, we recommend set path to the pre-SOT-FT semantic encoder
-  # model.audio_encoder.pretrained_model= 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec bash "$SCRIPT_DIR/train_AliMeeting_qwen25_omni_7b_crossattn.sh" "$@"

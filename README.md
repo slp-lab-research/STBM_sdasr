@@ -1,3 +1,9 @@
+# STBM: Qwen2.5 Omni speech diarization and recognition
+
+Model setup, architecture, training, decoding, and attribution are documented in [the STBM model README](examples/tagspeech/README.md). This repository retains the Auden framework used by the model.
+
+---
+
 # Auden: Audio & Multimodal Understanding Research Toolbox
 
 A comprehensive toolbox for audio & multimodal understanding tasks including ASR, CLAP, audio captioning, speaker identification, speech-llm and more.

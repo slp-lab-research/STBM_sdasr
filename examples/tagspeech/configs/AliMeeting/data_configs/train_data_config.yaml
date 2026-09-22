@@ -1,8 +1,10 @@
+# Replace /path/to/... with local paths; relative paths start at examples/tagspeech.
 
 # Get the data and manifests from lhotse:
 # https://github.com/lhotse-speech/lhotse/blob/master/lhotse/recipes/alimeeting.py
 # https://lhotse.readthedocs.io/en/latest/api.html#lhotse.cut.MultiCut.trim_to_supervision_groups
 
 - name: alimeeting-train-utterance-group
-  manifest: /AliMeeting_manifests/alimeeting-far_train_multiASR.jsonl.gz
+  manifest: AliMeeting_manifests/alimeeting-far_train_multiASR.jsonl.gz
   hours: 104
+  lang: zh

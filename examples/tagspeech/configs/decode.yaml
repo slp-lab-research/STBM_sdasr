@@ -1,28 +1,31 @@
-exp_dir:
+# Model directory; replace if your trained model is stored elsewhere.
+exp_dir: experiments/diarization_AMI_speaker_kernel_crossattn_qwen25_omni_7b
 checkpoint:
-  # [Checkpoint Loading Priority]
-  # 1. If 'filename' is provided, load directly from: {exp_dir}/{filename}
-  # 2. Else if 'iter' > 0, load from: {exp_dir}/averaged_iter{iter}_avg{avg}.pt if exists else do model averaging from checkpoint-xxx.pt
-  # 3. Else if 'epoch' > 0, load from: {exp_dir}/averaged_epoch{epoch}_avg{avg}.pt if exists else do model averaging from epoch-xxx.pt
-  filename:                 # e.g., "averaged-iter-25000-avg-0.pt"
-  iter: 0                   # e.g., 25000
-  epoch: 0                  # e.g., 30
-  avg: 0                    # how many checkpoints to average
+  # Loading priority: filename, then iteration averaging, then epoch averaging.
+  filename:                 # Existing filename inside exp_dir, if selected.
+  iter: 100000              # Set to an available checkpoint iteration.
+  epoch: 0
+  avg: 5                    # Number of available checkpoints to average.
 
 decoding_method: greedy_search
 
 prompt_file: configs/prompt.yaml
 
 data:
+  # Relative to examples/tagspeech; edit manifest paths in this YAML.
   test_data_config: configs/AMI/data_configs/test_data_config.yaml
-  max_duration: 1000 # single A100=1000, single H200=3000
+  max_duration: 1000
   num_workers: 1
   sampling_rate: 16000
+  channel: 0
 
-# Decode-time options
+# Decode-time options.
 decode:
-  compute_accuracy: false     # calculte token-level acc
-  min_duration: 0.5 # filter too short cuts
-  max_duration: 80 # filter too long cuts
+  temporal_intervention: null # Optional: normal, bypass, or center_only.
+  compute_accuracy: false    # Compute token accuracy when enabled.
+  min_duration: 0.5
+  max_duration: 80
   max_supervisions_per_cut: 9999
-
+  filter_cut_ids_file: null   # Optional local file of selected cut IDs.
+  single_cut_batches: false
+  output_tag: null            # Optional suffix for output filenames.

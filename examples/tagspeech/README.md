@@ -1,215 +1,157 @@
-# TagSpeech: Unified E2E Multi-Speaker ASR and Diarization Model
+# Qwen2.5 Omni with sinusoidal speaker kernels
 
-[![arXiv](https://img.shields.io/badge/arXiv-2601.06896-b31b1b.svg)](https://arxiv.org/abs/2601.06896)
-[![Model AMI](https://img.shields.io/badge/🤗%20HuggingFace-TagSpeech--AMI-yellow)](https://huggingface.co/AudenAI/TagSpeech-AMI)
-[![Model Alimeeting](https://img.shields.io/badge/🤗%20HuggingFace-TagSpeech--Alimeeting-yellow)](https://huggingface.co/AudenAI/TagSpeech-Alimeeting)
+This TagSpeech variant performs multi-speaker transcription and diarization using a frozen Qwen2.5 Omni Thinker, separate semantic and voice encoders, and trainable speaker conditioning.
 
-This example presents TagSpeech, a fully end-to-end multi-speaker ASR and diarization framework built on the LALM code of Auden. It takes the raw waveform of multi-speaker conversation and directly outputs a structured output containing timestamps, speaker label, gender, and speaker-attributed ASR transcription. 
+The main pipeline is:
 
-<video src="assets/demo.mp4" controls="controls" style="max-width: 100%;">
-</video>
+```text
+Audio → semantic encoder → projector → numeric anchors ────── queries
+Audio → voice encoder → projector → temporal convolution
+                                  → sinusoidal kernel ────── keys/values
+                                            │                    │
+                                            ↓                    ↓
+                                      boundary head       cross-attention
+                                                                 ↓
+                                                            MLP adapter
+                                                                 ↓
+                                               residual to semantic features
+                                                                 ↓
+                                                     Qwen2.5 Omni Thinker
+                                                                 ↓
+                                                  timestamped text and speakers
+```
 
-If Demo is not displayed automatically, download from "/assets/demo.mp4" (669 KB)
+The kernel operates on speaker features. Cross-attention combines the streams afterward. Temporal convolution also uses a residual connection. The main configuration trains with XML token cross-entropy plus boundary binary cross-entropy, with both loss weights set to 1.0. It does not use CTC.
+
+`ordered_kernel_*` is the existing configuration naming for sinusoidal kernels. “Ordered” refers to speaker slots indexed by first appearance within an input example. These keys remain unchanged for compatibility. The LLM generates speaker IDs; kernel slots are not directly decoded into XML IDs.
 
 
-<p align="center">
-  <img src="assets/model_structure.png" width="800"/>
-</p>
 
+## Setup
 
-The model uses:
-- **Dual Encoders**: Semantic encoder fined-tuned by Serialized Output Training (SOT) for content understanding + Voice encoder for speaker identity
-- **Dual Projectors**: Separate projection heads for each encoder
-- **Numeric Anchors**: Digit embeddings (1, 2, 3, ...) inserted at regular intervals to improve temporal awareness and synchronization between semantic and voice features
-- **LLM Backend**: Qwen2.5-7B-Instruct for sequence modeling. Frozen during training.
-
-## Installation
-
-In addition to the base Auden framework, this example requires the following packages:
+From the repository root, install Auden in an environment with compatible PyTorch, Torchaudio, k2, and Transformers dependencies:
 
 ```bash
+pip install -e .
 pip install meeteval scipy
+python -c "from transformers import Qwen2_5OmniThinkerForConditionalGeneration"
+cd examples/tagspeech
 ```
 
-- **meeteval**: For computing cpWER (concatenated minimum-permutation word error rate) and DER (diarization error rate) metrics
-- **scipy**: For optimal speaker matchin when using the Hungarian algorithm when calculating gender accuracy (optional)
+The import check verifies that the installed Transformers version exposes the required Thinker class. Training requires GPU resources appropriate for the frozen 7B model and the configured batch duration.
 
+## Set local paths
 
-## Quick Inference
+Run the following commands from `examples/tagspeech`. Paths beginning with `/path/to/` are placeholders and must be replaced. Relative paths are resolved from this directory.
 
-```python
-import torch
-from model import TagSpeechModel
-from utils.xml_utils import xml_to_json
+| Asset | Setting or location |
+|---|---|
+| Complete local Qwen2.5 Omni checkpoint | `model.llm.pretrained_model` in `configs/train_qwen25_omni_7b_speaker_kernel_alimeeting.yaml`; inherited by AMI |
+| Semantic encoder checkpoint | `model.audio_encoder.pretrained_model` in the selected dataset config |
+| Voice encoder checkpoint | `model.voice_encoder.pretrained_model` in the selected dataset config |
+| Train/validation/test manifests | `manifest` entries in `configs/AMI/data_configs/` or `configs/AliMeeting/data_configs/` |
+| Training output directory | `exp_dir` in the selected training config |
+| Model directory for decoding | `exp_dir` in `configs/decode.yaml` |
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = TagSpeechModel.from_pretrained("AudenAI/TagSpeech-AMI").to(device) # use "AudenAI/TagSpeech-Alimeeting" for Mandarin data
+The Omni loader uses local files only. Set its path to a complete downloaded checkpoint directory, not just a weights file. For example:
 
-wav_files = ["assets/test_example_AMI_EN2002c-12-0-35.wav"]
-
-audio_token = model.config.audio_token
-messages = [
-    [{"role": "user", "content": f"<text>{audio_token}</text>\n<speaker>{audio_token}</speaker>"}]
-    for _ in wav_files
-]
-
-outputs = model.generate(wav_files, messages, max_new_tokens=800, num_beams=1, do_sample=False)
-
-# Print outputs in XML and JSON formats
-for i, output in enumerate(outputs, 1):
-    print(f"\n{'='*80}\nOutput {i}/{len(outputs)} - XML:\n{'='*80}\n{output}\n{'='*80}")
-    
-    json_output = xml_to_json(output)
-    if json_output:
-        print(f"\nOutput {i}/{len(outputs)} - JSON:\n{'='*80}\n{json_output}\n{'='*80}")
-    else:
-        print(f"\n⚠️  Warning: Output {i} could not be parsed as valid XML\n{'='*80}")
+```yaml
+model:
+  llm:
+    pretrained_model: /path/to/Qwen2.5-Omni-7B
 ```
 
-## Train Your Model
+The AMI defaults expect encoder files under `experiments/diarization_AMI/audio_encoder/` and `experiments/diarization_AMI/voice_encoder/`. Place the corresponding encoder weights and configurations there, or update their paths. The older `diarization_AMI` directory supplies encoder assets; the new training output uses a separate directory.
 
-### Step 1: Generate Time Anchor Embeddings
+Dataset manifests must reference accessible audio files and, when applicable, feature files. Updating the YAML manifest location alone does not rewrite paths inside a manifest. Dataset preparation helpers under `dataset/` use paths relative to this example directory.
 
-Before training, generate numeric anchor embeddings from a pretrained LLM:
+## Training
+
+For AMI:
 
 ```bash
-python utils/generate_anchor_embeddings.py \
-    --model_path /path/to/Qwen2.5-7B-Instruct \
-    --output_path utils/digit_embeddings.pt
+bash scripts/train_AMI_qwen25_omni_7b_crossattn.sh \
+  model.llm.pretrained_model=/path/to/Qwen2.5-Omni-7B
 ```
 
-This creates `digit_embeddings.pt` which is required for training.
-
-### Step 2: Training
+For AliMeeting:
 
 ```bash
-# Train on AMI dataset
-./scripts/train_AMI.sh
-
-# Train on AliMeeting dataset
-./scripts/train_AliMeeting.sh
+bash scripts/train_AliMeeting_qwen25_omni_7b_crossattn.sh \
+  model.llm.pretrained_model=/path/to/Qwen2.5-Omni-7B
 ```
 
-### Step 3: Decoding
+These scripts launch one process and accept additional Hydra overrides. AMI inherits the AliMeeting cross-attention configuration, which inherits `configs/train.yaml`; retain all three files. Numeric anchor embeddings are generated from the active Omni decoder during training and saved with the experiment. No separate anchor-generation command is needed for this configuration.
+
+The full configuration enables temporal convolution, sinusoidal speaker kernels, cross-attention with an MLP adapter, and boundary supervision. The `boundary_only`, `kernel_temporal_no_boundary`, `kernel_boundary_no_temporal_convolution`, and `temporal_boundary_no_kernel` configurations provide component ablations. Older Qwen3 and CTC launchers are not entry points for this model release.
+
+## Decoding
+
+`configs/decode.yaml` selects:
+
+```yaml
+exp_dir: experiments/diarization_AMI_speaker_kernel_crossattn_qwen25_omni_7b
+```
+
+Set `checkpoint.iter` to an iteration present in that directory and `checkpoint.avg` to the desired number of available checkpoints to average. The checked-in iteration is an example, not a selected paper checkpoint.
 
 ```bash
-# Decode AMI test set
-./scripts/decode_AMI.sh
-
-# Decode AliMeeting test set
-./scripts/decode_AliMeeting.sh
+# Example: use only if these checkpoints are available.
+python decode.py checkpoint.iter=28000 checkpoint.avg=5
 ```
 
-### Step 4: Evaluation
+Alternatively, select an existing checkpoint by filename:
 
 ```bash
-# Evaluate results with cpWER and DER metrics
-python evaluate.py --xml_file /exp/output_xml.txt
+python decode.py checkpoint.filename=checkpoint-28000.pt
 ```
 
-The evaluation outputs the following metrics:
-- **cpWER**: Concatenated minimum-permutation word error rate (speaker-aware ASR)
-- **Global WER**: Speaker-agnostic word error rate (pure ASR)
-- **DER**: Diarization error rate with miss/false alarm/confusion breakdown
-- **Gender Accuracy**: Time-weighted gender prediction accuracy
-- **Speaker Count**: Exact match rate and mean absolute error for number of speakers
+`checkpoint.filename` takes precedence over iteration/epoch averaging. `bash scripts/decode_AMI.sh` uses the same default experiment and accepts these overrides. For AliMeeting, also override `exp_dir` and `data.test_data_config` with the corresponding AliMeeting paths.
 
+When moving a trained experiment to another machine, update `qwen2_5_omni_pretrained_model` in its saved `config.json`. Keep its tokenizer files, `digit_embeddings.pt`, encoder configurations and weights, and selected model/trainer checkpoints available. Saved experiment files are separate from the source YAML configuration.
 
-## Data Preparation and Format
+## Output and evaluation
 
-We use the [Lhotse](https://github.com/lhotse-speech/lhotse) toolkit to prepare audio manifests with multi-speaker supervision for both **AMI** and **AliMeeting** datasets.
+Decoding writes reference and predicted XML-style transcripts under `<exp_dir>/greedy_search/`. Output includes timestamps, text, speaker IDs, and gender tags:
 
-### Step 1: Download and Prepare Datasets
-
-To download and prepare the datasets, please follow the official Lhotse recipes:
-
-- **AMI**: [ami.py](https://github.com/lhotse-speech/lhotse/blob/master/lhotse/recipes/ami.py)
-- **AliMeeting**: [ali_meeting.py](https://github.com/lhotse-speech/lhotse/blob/master/lhotse/recipes/ali_meeting.py)
-
-After generating recordings and supervision manifests, we further segment multi-speaker audio using Lhotse's [`MultiCut.trim_to_supervision_groups`](https://lhotse.readthedocs.io/en/latest/api.html#lhotse.cut.MultiCut.trim_to_supervision_groups) function, with max_pause=0.0.
-
-This step groups overlapping speaker turns into a single utterance-level segment while preserving speaker annotations.
-
-### Step 2: Custom Dataset (Optional)
-
-If you prepare your own multi-speaker meeting-style dataset, we recommend following a similar **utterance-group segmentation** strategy as described in the paper: https://arxiv.org/abs/2211.00482
-
-Each segment should be represented as a `MonoCut` containing multiple speaker turns (supervisions).
-
-### Manifest Format
-
-Below is an example of a `MonoCut` stored in JSON format, with 2 female speakers.
-Each cut contains a segment from a long recording and multiple supervisions (speaker turns).  
-
-```json
-{
-  "id": "ES2004b-0-0-6",
-  "start": 80.31,
-  "duration": 3.09,
-  "channel": 0,
-  "supervisions": [
-    {
-      "id": "ES2004b-1",
-      "recording_id": "ES2004b",
-      "start": 0.0,
-      "duration": 1.21,
-      "channel": [0],
-      "text": "UH NO THAT'S OKAY SORRY",
-      "language": "English",
-      "speaker": "FEE016",
-      "gender": "F"
-    },
-    {
-      "id": "ES2004b-171",
-      "recording_id": "ES2004b",
-      "start": 0.96,
-      "duration": 2.13,
-      "channel": [0],
-      "text": "OKAY UM",
-      "language": "English",
-      "speaker": "FEE013",
-      "gender": "F"
-    }
-  ],
-  "recording": {
-    "id": "ES2004b",
-    "sources": [
-      {
-        "type": "file",
-        "channels": [0],
-        "source": "/path/to/audio/ES2004b.Array1-01.wav"
-      }
-    ],
-    "sampling_rate": 16000,
-    "num_samples": 37527894,
-    "duration": 2345.493375,
-    "channel_ids": [0]
-  },
-  "type": "MonoCut"
-}
-```
-
-
-
-During training and inference, each example is converted into an XML-like representation that decouples textual content and speaker metadata. This format supports our model's disentangled dual streams, time anchoring, and efficient token representation:
 ```xml
 <text>
-0.00-1.21>UH NO THAT'S OKAY SORRY
-0.96-2.13>OKAY UM
+0.00-1.50>Hello.
+1.50-3.00>Hi there.
 </text>
 <speaker>
-<spk id="1" g="f" t="0.00-1.21"/>
-<spk id="2" g="f" t="0.96-2.13"/>
+<spk id="1" g="m" t="0.00-1.50"/>
+<spk id="2" g="f" t="1.50-3.00"/>
 </speaker>
 ```
-You may parse the output into desired formats, e.g., JSON.
 
+Evaluate a generated results file:
 
-
-## Citation
-If you use TagSpeech in your research, please cite:
-
+```bash
+python evaluate.py --xml_file /path/to/xml-outputs-ami-test-utterance-group-iter-28000-avg-5.txt
 ```
+
+## Implementation
+
+| File | Purpose |
+|---|---|
+| `train.py` / `model_config.py` | Model loading and configuration |
+| `model.py` | Encoders, projectors, numeric anchors, and LLM integration |
+| `modules/speaker_kernel_cross_attention.py` | Temporal convolution, cross-attention, MLP, and boundary head |
+| `modules/speaker_only_kernel.py` | Speaker probabilities and sinusoidal kernel encoding |
+| `trainer.py` | XML/LLM and boundary losses |
+| `data_module.py` / `multi_speaker_dataset.py` | Manifest loading and batching |
+| `decode.py` / `evaluate.py` | Decoding and evaluation |
+
+The current imports also require the legacy `shared_segment_conditioner.py` and `sin_kernel_ordered.py` files, even though the main cross-attention configuration does not execute their conditioner. Include `src/auden/` and the package installation files when sharing the implementation.
+
+## License and attribution
+
+This implementation builds on [TagSpeech in Auden](https://github.com/AudenAI/Auden/tree/main/examples/tagspeech). The repository's [LICENSE](../../LICENSE) and [NOTICE](../../NOTICE) accompany this code.
+
+## TagSpeech citation
+
+```bibtex
 @article{huo2026tagspeech,
   title={TagSpeech: End-to-End Multi-Speaker ASR and Diarization with Fine-Grained Temporal Grounding},
   author={Huo, Mingyue and Shao, Yiwen and Zhang, Yuheng},

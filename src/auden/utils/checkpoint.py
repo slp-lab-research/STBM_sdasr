@@ -426,10 +426,49 @@ def make_averaged_model_state_dict(exp_dir, iter, epoch, avg):
             f"{start} (excluded) to {epoch}"
         )
 
-    state_dict = average_checkpoints_with_averaged_model(
-        filename_start=filename_start,
-        filename_end=filename_end,
-    )
+    # The interval formula above requires checkpoints produced with
+    # trainer.use_averaged_model=true.  Runs that disable that option only
+    # contain ordinary ``model`` snapshots; average the requested number of
+    # snapshots directly in that case.
+    end_checkpoint = torch.load(filename_end, map_location="cpu")
+    if "model_avg" in end_checkpoint:
+        state_dict = average_checkpoints_with_averaged_model(
+            filename_start=filename_start,
+            filename_end=filename_end,
+        )
+    else:
+        if iter <= 0:
+            raise ValueError(
+                "Direct averaging of checkpoints without 'model_avg' currently "
+                "requires iteration-based checkpoints."
+            )
+        filenames = find_checkpoints(exp_dir, iteration=-iter)[:avg]
+        if len(filenames) < avg:
+            raise ValueError(
+                f"Not enough checkpoints ({len(filenames)}) found for"
+                f" --iter {iter}, --avg {avg}"
+            )
+        logging.info(
+            "Checkpoints do not contain model_avg; directly averaging model "
+            f"snapshots: {filenames}"
+        )
+        state_dict = end_checkpoint.get("model")
+        if not isinstance(state_dict, dict):
+            raise ValueError(
+                f"Trainer checkpoint {filename_end} contains neither a model_avg "
+                "nor a model state dict."
+            )
+        for index, filename in enumerate(filenames[1:], start=1):
+            checkpoint = torch.load(filename, map_location="cpu")
+            model = checkpoint.get("model")
+            if not isinstance(model, dict):
+                raise ValueError(f"Trainer checkpoint {filename} has no model state dict")
+            average_state_dict(
+                state_dict_1=state_dict,
+                state_dict_2=model,
+                weight_1=index / (index + 1),
+                weight_2=1 / (index + 1),
+            )
 
     return state_dict
 

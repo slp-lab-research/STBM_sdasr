@@ -40,3 +40,13 @@ mlruns/
 # Example runtime outputs
 examples/**/exp/
 examples/**/outputs/
+
+# STBM generated data and local experiments
+/examples/tagspeech/experiments/
+/examples/tagspeech/AMI_manifests/
+/examples/tagspeech/AliMeeting_manifests/
+/review/
+*.safetensors
+*.sbatch
+/examples/tagspeech/dataset/ami/*/
+/examples/tagspeech/dataset/ali/*/

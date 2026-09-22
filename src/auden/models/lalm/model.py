@@ -8,7 +8,12 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer as HFTokenizer
-from transformers.modeling_utils import no_init_weights
+try:
+    # transformers < 5
+    from transformers.modeling_utils import no_init_weights
+except ImportError:
+    # transformers >= 5 moved initialization helpers out of modeling_utils.
+    from transformers.initialization import no_init_weights
 from transformers.trainer_pt_utils import LabelSmoother
 
 from ...auto.auto_config import AutoConfig
@@ -29,6 +34,17 @@ CHAT_TEMPLATE = """{% for message in messages -%}
 {% if add_generation_prompt -%}
 <|im_start|>assistant
 {% endif -%}"""
+
+
+def get_llm_hidden_size(llm_config) -> int:
+    """Return the causal text width, including for a Qwen3-Omni Thinker."""
+    # === QWEN3-OMNI-30B INTEGRATION START ===
+    if hasattr(llm_config, "thinker_config"):
+        llm_config = llm_config.thinker_config
+    if hasattr(llm_config, "text_config"):
+        llm_config = llm_config.text_config
+    # === QWEN3-OMNI-30B INTEGRATION END ===
+    return int(llm_config.hidden_size)
 
 
 class EncoderProjector(nn.Module):
@@ -159,6 +175,7 @@ class LalmModel(nn.Module):
         config: LalmConfig,
         tokenizer,
         llm_dtype: torch.dtype | str | None = torch.float16,
+        pretrained_llm=None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -212,22 +229,36 @@ class LalmModel(nn.Module):
 
         # 2) LLM
         attn_impl = "flash_attention_2" if self.use_flash_attn else "sdpa"
-        with no_init_weights():
-            self.llm = AutoModelForCausalLM.from_config(
-                self.config.llm_config,
-                attn_implementation=attn_impl,
-                torch_dtype=self.llm_dtype,
-            )
+        # === QWEN3-OMNI-30B INTEGRATION START ===
+        # Accepting the already-loaded Thinker avoids holding two 30B model
+        # instances while TagSpeech is assembled.
+        if pretrained_llm is not None:
+            self.llm = pretrained_llm
+        else:
+            with no_init_weights():
+                if self.config.llm_config.model_type == "qwen3_omni_moe_thinker":
+                    from transformers import Qwen3OmniMoeThinkerForConditionalGeneration
+
+                    self.llm = Qwen3OmniMoeThinkerForConditionalGeneration(
+                        self.config.llm_config
+                    )
+                else:
+                    self.llm = AutoModelForCausalLM.from_config(
+                        self.config.llm_config,
+                        attn_implementation=attn_impl,
+                        torch_dtype=self.llm_dtype,
+                    )
+        # === QWEN3-OMNI-30B INTEGRATION END ===
 
         # 3) Projector
         self.encoder_projector = EncoderProjector(
             self.audio_encoder_dim,
-            self.llm.config.hidden_size,
+            get_llm_hidden_size(self.llm.config),
             self.config.audio_encoder_projector_ds_rate,
         )
         if self.config.tag_audio_boundary:
             self.audio_tag_embedding = nn.Parameter(
-                torch.zeros((2, self.llm.config.hidden_size), dtype=self.llm_dtype)
+                torch.zeros((2, get_llm_hidden_size(self.llm.config)), dtype=self.llm_dtype)
             )
 
     def forward_audio_features(self, x: torch.Tensor, x_lens: torch.Tensor):

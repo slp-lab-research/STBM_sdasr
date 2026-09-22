@@ -1,4 +1,5 @@
 import logging
+import json
 import os
 from typing import List
 
@@ -66,7 +67,25 @@ class ZipformerEncoderModel(nn.Module):
             weight_path = model_path
             model_dir, _ = os.path.split(model_path)
 
-        config = AutoConfig.from_pretrained(model_dir)
+        # A converted encoder may be stored as a named weight/config pair, e.g.
+        # model_ami_audio.safetensors + config_ami_audio.json.  When a direct
+        # weight path is supplied, prefer its matching config instead of the
+        # unrelated config.json that may also exist in the directory.
+        config_path = None
+        if not os.path.isdir(model_path):
+            weight_stem = os.path.splitext(os.path.basename(weight_path))[0]
+            if weight_stem.startswith("model_"):
+                suffix = weight_stem[len("model_") :]
+                candidate = os.path.join(model_dir, f"config_{suffix}.json")
+                if os.path.exists(candidate):
+                    config_path = candidate
+
+        if config_path is not None:
+            with open(config_path, "r") as f:
+                config = AutoConfig.for_model(**json.load(f))
+            logging.info(f"Loaded encoder config from {config_path}")
+        else:
+            config = AutoConfig.from_pretrained(model_dir)
         ext = os.path.splitext(weight_path)[1].lower()
         if ext == ".safetensors":
             from safetensors.torch import load_file as safe_load_file

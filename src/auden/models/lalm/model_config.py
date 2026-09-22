@@ -28,7 +28,7 @@ class LalmConfig(BaseConfig):
         if isinstance(audio_encoder_config, dict):
             try:
                 audio_encoder_config = AutoConfig.for_model(**audio_encoder_config)
-            except Exception as e:
+            except ValueError:
                 audio_encoder_config = HFConfig.for_model(**audio_encoder_config)
         elif audio_encoder_config is None:
             from ...models.zipformer.model_config import ZipformerConfig
@@ -42,7 +42,14 @@ class LalmConfig(BaseConfig):
 
         # LLM config (HF)
         if isinstance(llm_config, dict):
-            llm_config = HFConfig.for_model(**llm_config)
+            if llm_config.get("model_type") == "qwen2_5_omni_thinker":
+                from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
+                    Qwen2_5OmniThinkerConfig,
+                )
+
+                llm_config = Qwen2_5OmniThinkerConfig.from_dict(llm_config)
+            else:
+                llm_config = HFConfig.for_model(**llm_config)
         elif llm_config is None:
             from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 

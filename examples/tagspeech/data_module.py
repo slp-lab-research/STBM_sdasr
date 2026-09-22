@@ -40,6 +40,7 @@ input_strategy, and sampler construction utilities.
 
 import logging
 from collections import defaultdict
+from functools import partial
 
 import torch
 import yaml
@@ -50,6 +51,11 @@ from torch.utils.data import DataLoader
 
 from auden.data.lhotse_datamodule import BaseLhotseDatamodule, _SeedWorkers
 from auden.utils.text_normalization import text_normalization
+
+
+def _select_channel(cut, channel: int):
+    """Select one audio channel without making LazyMapper unpicklable."""
+    return cut.with_channels(channel)
 
 
 class AsrDatamodule(BaseLhotseDatamodule):
@@ -69,7 +75,7 @@ class AsrDatamodule(BaseLhotseDatamodule):
         Lhotse's duration mismatch tolerance slightly to avoid interruptions.
         """
         # NOTE: some data contains minor inconsistency
-        set_audio_duration_mismatch_tolerance(0.1)
+        set_audio_duration_mismatch_tolerance(0.5)
         super().__init__(cfg)
 
     def _filter_cutset(self, cutset, split="train"):
@@ -120,12 +126,12 @@ class AsrDatamodule(BaseLhotseDatamodule):
                 text = sup.text
                 if len(text) == 0 or len(text) > c.duration * 30:
                     return False
-            
+
             # Additional check: if there are too many overlapping supervisions, skip this cut
             # This might cause audio feature extraction issues
             if len(c.supervisions) > 10:  # Skip cuts with too many supervisions
                 return False
-                
+
             return True
 
         # Select single channel if configured (for multi-channel audio files)
@@ -134,8 +140,8 @@ class AsrDatamodule(BaseLhotseDatamodule):
         channel = self.cfg.get("channel", None)
         if channel is not None:
             logging.info(f"Selecting channel {channel} for multi-channel audio")
-            cutset = cutset.map(lambda c: c.with_channels(channel))
-        
+            cutset = cutset.map(partial(_select_channel, channel=channel))
+
         if self.cfg.text_normalization:
             cutset = cutset.map(text_normalization_on_cut)
         cutset = cutset.filter(remove_short_and_long_utt)
@@ -185,7 +191,7 @@ class AsrDatamodule(BaseLhotseDatamodule):
             channel = self.cfg.get("channel", None)
             if channel is not None:
                 logging.info(f"Selecting channel {channel} for multi-channel audio")
-                cutset = cutset.map(lambda c: c.with_channels(channel))
+                cutset = cutset.map(partial(_select_channel, channel=channel))
             hours = train_set["hours"]
             weight = train_set.get("weights", 1)
             lang = train_set.get("lang", "zh")
@@ -253,7 +259,7 @@ class AsrDatamodule(BaseLhotseDatamodule):
             sampler=train_sampler,
             batch_size=None,
             num_workers=self.cfg.get("num_workers", 8),
-            persistent_workers=True,
+            persistent_workers=self.cfg.get("num_workers", 8) > 0,
             worker_init_fn=worker_init_fn,
         )
 
@@ -282,7 +288,7 @@ class AsrDatamodule(BaseLhotseDatamodule):
             channel = self.cfg.get("channel", None)
             if channel is not None:
                 logging.info(f"Selecting channel {channel} for multi-channel audio")
-                cutset = cutset.map(lambda c: c.with_channels(channel))
+                cutset = cutset.map(partial(_select_channel, channel=channel))
             cutset = self._filter_cutset(cutset, split="valid")
             valid_name = valid_set["name"]
 
