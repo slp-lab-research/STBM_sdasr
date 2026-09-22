@@ -1,4 +1,4 @@
-# Qwen2.5 Omni with sinusoidal speaker kernels
+# Speaker-Aware Temporal and Boundary Modeling for Joint Speaker Diarization and Automatic Speech Recognition
 
 This TagSpeech variant performs multi-speaker transcription and diarization using a frozen Qwen2.5 Omni Thinker, separate semantic and voice encoders, and trainable speaker conditioning.
 
@@ -16,12 +16,12 @@ Audio → voice encoder → projector → temporal convolution
                                                                  ↓
                                                residual to semantic features
                                                                  ↓
-                                                     Qwen2.5 Omni Thinker
+                                                                LLM
                                                                  ↓
                                                   timestamped text and speakers
 ```
 
-The kernel operates on speaker features. Cross-attention combines the streams afterward. Temporal convolution also uses a residual connection. The main configuration trains with XML token cross-entropy plus boundary binary cross-entropy, with both loss weights set to 1.0. It does not use CTC.
+The kernel operates on speaker features. Cross-attention combines the streams afterward. Temporal convolution also uses a residual connection. The main configuration trains with XML token cross-entropy plus boundary binary cross-entropy, with both loss weights set to 1.0. 
 
 `ordered_kernel_*` is the existing configuration naming for sinusoidal kernels. “Ordered” refers to speaker slots indexed by first appearance within an input example. These keys remain unchanged for compatibility. The LLM generates speaker IDs; kernel slots are not directly decoded into XML IDs.
 
